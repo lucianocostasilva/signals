@@ -1,0 +1,1170 @@
+"""
+(simple_quant_signals_tk.py)
+
+A simpler desktop GUI that **runs out of the box** using Tkinter (bundled with Python).
+It loads OHLCV data from **XLC Excel** files (or optional Yahoo Finance), computes key
+technical indicators, detects BUY/SELL signals, plots a chart, and lists signals in a table.
+
+Dependencies (install with pip):
+    pip install pandas numpy matplotlib yfinance openpyxl
+
+Run:
+    python simple_quant_signals_tk.py
+
+Notes:
+- Educational tool only; not financial advice.
+- **XLC Excel**: each sheet may contain one or more *pairs of columns* `[Date, Value]`.
+  The loader currently uses the **first pair** as Close; Yahoo fetch can supply OHLCV.
+- Yahoo fetch is optional and requires `yfinance`.
+"""
+from __future__ import annotations
+
+import sys
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+from datetime import date, datetime, timedelta
+from io import BytesIO
+import re
+
+import numpy as np
+import pandas as pd
+
+# Matplotlib
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import matplotlib.dates as mdates
+from matplotlib.ticker import PercentFormatter
+
+# Optional yfinance
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+
+# ----------------------------- Indicators & Signals ----------------------------- #
+@dataclass
+class Signal:
+    date: pd.Timestamp
+    side: str  # BUY / SELL
+    price: float
+    rule: str
+
+
+def sma(series: pd.Series, period: int) -> pd.Series:
+    return series.rolling(period, min_periods=period).mean().rename(f"SMA{period}")
+
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False, min_periods=period).mean().rename(f"EMA{period}")
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain, index=series.index).ewm(alpha=1/period, adjust=False).mean()
+    roll_down = pd.Series(loss, index=series.index).ewm(alpha=1/period, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    out = 100 - (100 / (1 + rs))
+    return out.rename(f"RSI{period}")
+
+
+def cross_signals(df: pd.DataFrame, fast: pd.Series, slow: pd.Series, label: str) -> List[Signal]:
+    buys = (fast > slow) & (fast.shift(1) <= slow.shift(1))
+    sells = (fast < slow) & (fast.shift(1) >= slow.shift(1))
+    sigs: List[Signal] = []
+    for d in df.index[buys.fillna(False)]:
+        sigs.append(Signal(d, "BUY", float(df.loc[d, "close"]), f"{label} bullish cross"))
+    for d in df.index[sells.fillna(False)]:
+        sigs.append(Signal(d, "SELL", float(df.loc[d, "close"]), f"{label} bearish cross"))
+    return sigs
+
+
+def rsi_signals(df: pd.DataFrame, r: pd.Series, low=30.0, high=70.0) -> List[Signal]:
+    up = (r > low) & (r.shift(1) <= low)
+    down = (r < high) & (r.shift(1) >= high)
+    sigs: List[Signal] = []
+    for d in df.index[up.fillna(False)]:
+        sigs.append(Signal(d, "BUY", float(df.loc[d, "close"]), f"RSI crosses up {low}"))
+    for d in df.index[down.fillna(False)]:
+        sigs.append(Signal(d, "SELL", float(df.loc[d, "close"]), f"RSI crosses down {high}"))
+    return sigs
+
+# --- Extra indicators ---
+
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    ema_fast = series.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = series.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = (ema_fast - ema_slow).rename("MACD")
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean().rename("Signal")
+    hist = (macd_line - signal_line).rename("Hist")
+    return macd_line, signal_line, hist
+
+
+def bollinger(series: pd.Series, period: int = 20, stds: float = 2.0):
+    ma = series.rolling(period, min_periods=period).mean()
+    sd = series.rolling(period, min_periods=period).std()
+    upper = (ma + stds * sd).rename(f"BBU{period}")
+    lower = (ma - stds * sd).rename(f"BBL{period}")
+    mid = ma.rename(f"BBM{period}")
+    return mid, upper, lower
+
+
+def stochastic_kd(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: int = 3):
+    ll = low.rolling(k, min_periods=k).min()
+    hh = high.rolling(k, min_periods=k).max()
+    k_line = 100 * (close - ll) / (hh - ll + 1e-12)
+    d_line = k_line.rolling(d, min_periods=d).mean()
+    return k_line.rename(f"STOCH%K{k}"), d_line.rename(f"STOCH%D{d}")
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = (pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1))
+    return tr.ewm(alpha=1/period, adjust=False).mean().rename(f"ATR{period}")
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14):
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = atr(high, low, close, period)
+    atr_vals = tr
+
+    plus_di = 100 * pd.Series(plus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean() / (atr_vals + 1e-12)
+    minus_di = 100 * pd.Series(minus_dm, index=high.index).ewm(alpha=1/period, adjust=False).mean() / (atr_vals + 1e-12)
+    dx = (100 * (plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12))
+    adx_line = dx.ewm(alpha=1/period, adjust=False).mean().rename(f"ADX{period}")
+    return adx_line, plus_di.rename(f"+DI{period}"), minus_di.rename(f"-DI{period}")
+
+
+def cci(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 20) -> pd.Series:
+    tp = (high + low + close) / 3.0
+    ma = tp.rolling(period, min_periods=period).mean()
+    md = (tp - ma).abs().rolling(period, min_periods=period).mean()
+    cci_v = (tp - ma) / (0.015 * (md + 1e-12))
+    return cci_v.rename(f"CCI{period}")
+
+
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    dir_ = np.sign(close.diff().fillna(0.0))
+    obv_v = (dir_ * volume.fillna(0)).cumsum()
+    return obv_v.rename("OBV")
+
+
+def mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, period: int = 14) -> pd.Series:
+    tp = (high + low + close) / 3.0
+    mf = tp * volume.fillna(0)
+    pos = (tp > tp.shift(1)).astype(float) * mf
+    neg = (tp < tp.shift(1)).astype(float) * mf
+    pos_sum = pos.rolling(period, min_periods=period).sum()
+    neg_sum = neg.rolling(period, min_periods=period).sum()
+    mfr = pos_sum / (neg_sum + 1e-12)
+    mfi_v = 100 - (100 / (1 + mfr))
+    return mfi_v.rename(f"MFI{period}")
+
+
+def roc(close: pd.Series, period: int = 12) -> pd.Series:
+    return (100 * (close / close.shift(period) - 1)).rename(f"ROC{period}")
+
+
+def williams_r(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    ll = low.rolling(period, min_periods=period).min()
+    hh = high.rolling(period, min_periods=period).max()
+    wr = -100 * (hh - close) / (hh - ll + 1e-12)
+    return wr.rename(f"W%R{period}")
+
+
+def vwap(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series) -> pd.Series:
+    tp = (high + low + close) / 3.0
+    vol = volume.fillna(0)
+    cum_vol = vol.cumsum()
+    cum_vp = (tp * vol).cumsum()
+    v = (cum_vp / (cum_vol.replace(0, np.nan))).rename("VWAP")
+    return v
+
+# --- Extra signal rules (simple) ---
+
+def macd_signals(df: pd.DataFrame, macd_line: pd.Series, signal_line: pd.Series) -> List[Signal]:
+    buys = (macd_line > signal_line) & (macd_line.shift(1) <= signal_line.shift(1))
+    sells = (macd_line < signal_line) & (macd_line.shift(1) >= signal_line.shift(1))
+    sigs: List[Signal] = []
+    for d in df.index[buys.fillna(False)]:
+        sigs.append(Signal(d, "BUY", float(df.loc[d, "close"]), "MACD bullish cross"))
+    for d in df.index[sells.fillna(False)]:
+        sigs.append(Signal(d, "SELL", float(df.loc[d, "close"]), "MACD bearish cross"))
+    return sigs
+
+
+def bbands_signals(df: pd.DataFrame, close: pd.Series, lower: pd.Series, upper: pd.Series) -> List[Signal]:
+    below_prev = close.shift(1) < lower.shift(1)
+    above_prev = close.shift(1) > upper.shift(1)
+    buy_mask = below_prev & (close > lower)
+    sell_mask = above_prev & (close < upper)
+    sigs: List[Signal] = []
+    for d in df.index[buy_mask.fillna(False)]:
+        sigs.append(Signal(d, "BUY", float(df.loc[d, "close"]), "Bollinger re-entry (from below)"))
+    for d in df.index[sell_mask.fillna(False)]:
+        sigs.append(Signal(d, "SELL", float(df.loc[d, "close"]), "Bollinger re-entry (from above)"))
+    return sigs
+
+
+def stoch_signals(df: pd.DataFrame, k_line: pd.Series, d_line: pd.Series, low=20.0, high=80.0) -> List[Signal]:
+    up = (k_line > d_line) & (k_line.shift(1) <= d_line.shift(1)) & (k_line < high)
+    down = (k_line < d_line) & (k_line.shift(1) >= d_line.shift(1)) & (k_line > low)
+    sigs: List[Signal] = []
+    for d in df.index[up.fillna(False)]:
+        sigs.append(Signal(d, "BUY", float(df.loc[d, "close"]), "Stoch %K crosses up %D"))
+    for d in df.index[down.fillna(False)]:
+        sigs.append(Signal(d, "SELL", float(df.loc[d, "close"]), "Stoch %K crosses down %D"))
+    return sigs
+
+
+# ----------------------------- Data helpers ----------------------------- #
+
+def read_xlc_all(path: str, sheet: int | str = 0) -> Dict[str, pd.Series]:
+    """Read *all* XLC pairs from a sheet and return a dict {name: Series}.
+    Works even if the workbook is open in Excel by reading the file into memory first.
+    Names are taken from the value column headers when available, otherwise
+    generated as series_0, series_1, ... The returned Series have a Date index.
+    """
+    # Read file bytes to avoid file locks; pandas accepts file-like objects
+    with open(path, "rb") as f:
+        bio = BytesIO(f.read())
+    df = pd.read_excel(bio, sheet_name=sheet, engine="openpyxl")
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    out: Dict[str, pd.Series] = {}
+    n_pairs = df.shape[1] // 2
+    for k in range(n_pairs):
+        i = 2 * k
+        dcol, vcol = df.columns[i], df.columns[i + 1]
+        dates = pd.to_datetime(df[dcol], errors="coerce")
+        vals = pd.to_numeric(df[vcol], errors="coerce")
+        s = pd.Series(vals.values, index=dates).dropna().sort_index()
+        name = str(vcol) if str(vcol).strip() else f"series_{k}"
+        out[name] = s
+    return out
+
+def read_xlc(path: str, pair_index: int = 0, sheet: int | str = 0) -> pd.DataFrame:
+    """Read an XLC-formatted Excel file where columns come in pairs [date, value].
+
+    Parameters
+    ----------
+    path : str
+        Path to .xlsx file
+    pair_index : int, default 0
+        Which pair to use (0-based). Pair 0 uses columns [0,1], pair 1 uses [2,3], etc.
+    sheet : int | str, default 0
+        Sheet index or name.
+
+    Returns
+    -------
+    DataFrame with Date index and a single 'close' float column.
+
+    Notes
+    -----
+    Opens the workbook in **read-only memory** by reading bytes first so it works
+    while the file is open in Excel.
+    """
+    with open(path, "rb") as f:
+        bio = BytesIO(f.read())
+    df = pd.read_excel(bio, sheet_name=sheet, engine="openpyxl")
+    # Drop fully empty columns/rows
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if df.shape[1] < 2:
+        raise ValueError("XLC needs at least two columns: [date, value].")
+
+    i = 2 * pair_index
+    if i + 1 >= df.shape[1]:
+        raise ValueError(f"XLC pair index {pair_index} out of range for sheet '{sheet}'.")
+
+    date_col = df.columns[i]
+    val_col = df.columns[i + 1]
+
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df[date_col], errors="coerce"),
+        "close": pd.to_numeric(df[val_col], errors="coerce"),
+    })
+    out = out.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+    out = out.drop_duplicates(subset=["date"], keep="last")
+    out.set_index("date", inplace=True)
+    return out
+
+# ---- XLC helpers: list sheets and pair names ----
+
+def xlc_sheet_names(path: str) -> List[str]:
+    with open(path, "rb") as f:
+        bio = BytesIO(f.read())
+    try:
+        xls = pd.ExcelFile(bio, engine="openpyxl")
+        return xls.sheet_names
+    except Exception:
+        return [0]
+
+def xlc_pair_names(path: str, sheet: int | str) -> List[str]:
+    with open(path, "rb") as f:
+        bio = BytesIO(f.read())
+    df = pd.read_excel(bio, sheet_name=sheet, engine="openpyxl")
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    n_pairs = df.shape[1] // 2
+    names: List[str] = []
+    for k in range(n_pairs):
+        idx = 2 * k + 1
+        if idx < df.shape[1]:
+            names.append(str(df.columns[idx]))
+        else:
+            names.append(f"series_{k}")
+    return names
+
+
+# ---- Simple chooser dialog for XLC sheet/pair ----
+class XLCChooser(tk.Toplevel):
+    def __init__(self, master: tk.Misc, path: str):
+        super().__init__(master)
+        self.result = None
+        self.path = path
+        self.title("Choose XLC sheet & pair")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Sheet:").grid(row=0, column=0, sticky="w")
+        self.sheet_var = tk.StringVar()
+        sheets = xlc_sheet_names(path)
+        self.sheet_cb = ttk.Combobox(frm, textvariable=self.sheet_var, values=sheets, state="readonly", width=30)
+        self.sheet_cb.grid(row=0, column=1, padx=6, pady=4)
+
+        ttk.Label(frm, text="Pair (value column):").grid(row=1, column=0, sticky="w")
+        self.pair_var = tk.StringVar()
+        self.pair_cb = ttk.Combobox(frm, textvariable=self.pair_var, state="readonly", width=30)
+        self.pair_cb.grid(row=1, column=1, padx=6, pady=4)
+
+        self.overlay_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm, text="Plot other pairs as overlays", variable=self.overlay_var).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8,0))
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.RIGHT, padx=4)
+
+        # Init selections
+        self.sheet_var.set(sheets[0] if sheets else "0")
+        self._refresh_pairs()
+        self.sheet_cb.bind("<<ComboboxSelected>>", lambda e: self._refresh_pairs())
+        self.wait_visibility()
+        self.focus_set()
+
+    def _refresh_pairs(self):
+        names = xlc_pair_names(self.path, self.sheet_var.get())
+        labels = [f"{i}: {names[i]}" for i in range(len(names))]
+        self.pair_cb["values"] = labels
+        if labels:
+            self.pair_var.set(labels[0])
+        else:
+            self.pair_var.set("")
+
+    def _ok(self):
+        if not self.pair_var.get():
+            self._cancel(); return
+        lbl = self.pair_var.get()
+        idx_str, _, name = lbl.partition(":")
+        try:
+            pidx = int(idx_str.strip())
+        except Exception:
+            pidx = 0
+        self.result = {
+            "sheet": self.sheet_var.get(),
+            "pair_index": pidx,
+            "pair_name": name.strip(),
+            "plot_overlays": bool(self.overlay_var.get()),
+        }
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ParamDialog(tk.Toplevel):
+    SPEC = {
+        "SMA cross": [("fast", int, 1, 1000, 1), ("slow", int, 2, 2000, 1)],
+        "EMA cross": [("fast", int, 1, 1000, 1), ("slow", int, 2, 2000, 1)],
+        "RSI": [("period", int, 2, 1000, 1), ("low", float, 0, 100, 0.5), ("high", float, 0, 100, 0.5)],
+        "MACD": [("fast", int, 1, 1000, 1), ("slow", int, 2, 2000, 1), ("signal", int, 1, 400, 1)],
+        "Bollinger Bands": [("period", int, 2, 1000, 1), ("stds", float, 0.1, 10.0, 0.1)],
+        "Stochastic": [("k", int, 2, 1000, 1), ("d", int, 1, 400, 1)],
+        "ATR": [("period", int, 2, 1000, 1)],
+        "ADX": [("period", int, 2, 1000, 1)],
+        "CCI": [("period", int, 2, 1000, 1)],
+        "MFI": [("period", int, 2, 1000, 1)],
+        "ROC": [("period", int, 2, 1000, 1)],
+        "Williams %R": [("period", int, 2, 1000, 1)],
+    }
+    def __init__(self, master: tk.Misc, name: str, current: Dict[str, object]):
+        super().__init__(master)
+        self.title(f"{name} parameters"); self.resizable(False, False); self.transient(master); self.grab_set()
+        self.name = name; self.values = dict(current)
+        frm = ttk.Frame(self, padding=10); frm.pack(fill=tk.BOTH, expand=True)
+        self.vars = {}; r = 0
+        for key, typ, lo, hi, step in self.SPEC.get(name, []):
+            ttk.Label(frm, text=key).grid(row=r, column=0, sticky="w")
+            if typ is int:
+                v = tk.IntVar(value=int(self.values.get(key, 0)))
+                w = ttk.Spinbox(frm, from_=lo, to=hi, increment=step, textvariable=v, width=10)
+            else:
+                v = tk.DoubleVar(value=float(self.values.get(key, 0.0)))
+                w = ttk.Entry(frm, textvariable=v, width=12)
+            w.grid(row=r, column=1, padx=6, pady=3); self.vars[key] = v; r += 1
+        btns = ttk.Frame(frm); btns.grid(row=r, column=0, columnspan=2, sticky="e", pady=(8,0))
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="OK", command=self._ok).pack(side=tk.RIGHT, padx=4)
+        self.wait_visibility(); self.focus_set()
+    def _ok(self):
+        for key, typ, *_ in self.SPEC.get(self.name, []):
+            self.values[key] = typ(self.vars[key].get())
+        self.destroy()
+    def _cancel(self):
+        self.values = None; self.destroy()
+
+def fetch_yahoo(ticker: str, start: Optional[str] = None, end: Optional[str] = None, interval: str = "1d") -> pd.DataFrame:
+    if yf is None:
+        raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+
+    # Keep only the first symbol if user typed multiple (e.g., "AAPL, MSFT")
+    parts = ticker.replace(",", " ").replace(";", " ").split()
+    ticker = parts[0] if parts else ticker
+
+    # Common aliases (Yahoo uses caret ^ for indices)
+    alias = {
+        "SPX": "^GSPC",
+        "^SPX": "^GSPC",
+        "GSPC": "^GSPC",
+    }
+    ticker = alias.get(ticker.upper(), ticker)
+
+    kw: Dict[str, str] = {}
+    if start:
+        kw["start"] = start
+    if end:
+        kw["end"] = end
+
+    data = yf.download(ticker, interval=interval, progress=False, **kw)
+    if data.empty:
+        intraday = {"1h","30m","15m","5m"}
+        if interval in intraday:
+            raise ValueError("No data returned. Intraday history is limited (~60–90 days on Yahoo). Try a more recent start date or use 1d/1wk/1mo.")
+        raise ValueError("No data returned. Check ticker, interval, and date range.")
+
+    # If columns come as MultiIndex (can happen), pick the first ticker
+    if isinstance(data.columns, pd.MultiIndex):
+        # Determine which level holds OHLCV fields
+        if "Close" in data.columns.get_level_values(0):
+            # Level 0 = fields, Level 1 = tickers
+            first_t = data.columns.get_level_values(1).unique()[0]
+            data = data.xs(first_t, axis=1, level=1, drop_level=True)
+        else:
+            # Level 0 = tickers, Level 1 = fields
+            first_t = data.columns.get_level_values(0).unique()[0]
+            data = data.xs(first_t, axis=1, level=0, drop_level=True)
+
+    data = data.reset_index()
+    # Ensure a uniform 'Date' column (intraday may name it 'Datetime')
+    first_col = data.columns[0]
+    data["Date"] = pd.to_datetime(data[first_col])
+
+    # Prefer adjusted close if available
+    if "Adj Close" in data.columns:
+        data["Close"] = data["Adj Close"]
+
+    cols = [c for c in ["Date", "Open", "High", "Low", "Close", "Volume"] if c in data.columns]
+    out = data[cols].copy()
+    # Normalize headers (robust to tuples/objects)
+    out.columns = [str(c).lower() for c in out.columns]
+    out.set_index("date", inplace=True)
+    out.sort_index(inplace=True)
+    return out
+
+
+# ----------------------------- GUI ----------------------------- #
+class App(tk.Tk):
+    
+    def __init__(self):
+        super().__init__()
+        self.title("Quant Signals – Tkinter")
+        self.geometry("1100x720")
+        self.minsize(900, 600)
+
+        self.df: Optional[pd.DataFrame] = None
+        self.signals: Optional[pd.DataFrame] = None
+        self.xlc_overlays: Optional[Dict[str, pd.Series]] = None
+        self.returns_df: Optional[pd.DataFrame] = None
+        self.params = {
+            "SMA cross": {"fast": 10, "slow": 20},
+            "EMA cross": {"fast": 12, "slow": 26},
+            "RSI": {"period": 14, "low": 30.0, "high": 70.0},
+            "MACD": {"fast": 12, "slow": 26, "signal": 9},
+            "Bollinger Bands": {"period": 20, "stds": 2.0},
+            "Stochastic": {"k": 14, "d": 3},
+            "ATR": {"period": 14},
+            "ADX": {"period": 14},
+            "CCI": {"period": 20},
+            "OBV": {},
+            "MFI": {"period": 14},
+            "ROC": {"period": 12},
+            "Williams %R": {"period": 14},
+            "VWAP": {}
+        }
+
+        self._build_ui()
+
+    def _build_ui(self):
+        
+        # Top controls
+        ctrl = ttk.Frame(self, padding=8)
+        ctrl.pack(side=tk.TOP, fill=tk.X)
+
+        # CSV
+        self.xlc_path = tk.StringVar()
+        ttk.Button(ctrl, text="Load XLC", command=self.on_load_xlc).pack(side=tk.LEFT)
+        ttk.Entry(ctrl, textvariable=self.xlc_path, width=40).pack(side=tk.LEFT, padx=6)
+
+        # Yahoo
+        ttk.Label(ctrl, text="Ticker:").pack(side=tk.LEFT, padx=(12, 2))
+        self.ticker_var = tk.StringVar(value="SPX")
+        ttk.Entry(ctrl, textvariable=self.ticker_var, width=10).pack(side=tk.LEFT)
+        ttk.Button(ctrl, text="Fetch Yahoo", command=self.on_fetch_yahoo).pack(side=tk.LEFT, padx=6)
+        
+        # Optional range & interval controls
+        ttk.Label(ctrl, text="Start (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(12, 2))
+        self.start_var = tk.StringVar(value="")
+        ttk.Entry(ctrl, textvariable=self.start_var, width=12).pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="End (YYYY-MM-DD):").pack(side=tk.LEFT, padx=(8, 2))
+        self.end_var = tk.StringVar(value=date.today().isoformat())
+        ttk.Entry(ctrl, textvariable=self.end_var, width=12).pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="Interval:").pack(side=tk.LEFT, padx=(8, 2))
+        self.interval_var = tk.StringVar(value="1d")
+        self.interval_cb = ttk.Combobox(ctrl, textvariable=self.interval_var, width=6, values=("1d","1wk","1mo","1h","30m","15m","5m"), state="readonly")
+        self.interval_cb.pack(side=tk.LEFT)
+        
+        # default Start based on interval
+        self.start_var.set(self._default_start_from_end(self.end_var.get()))
+        self.interval_cb.bind("<<ComboboxSelected>>", lambda e: self.start_var.set(self._default_start_from_end(self.end_var.get())))
+        
+        # Indicator params (dropdown-only)
+        params = ttk.Frame(self, padding=(8, 0))
+        params.pack(side=tk.TOP, fill=tk.X)
+
+        self.sel_indicator = tk.StringVar(value="All indicators")
+        self.indicator_cb = ttk.Combobox(
+            params,
+            textvariable=self.sel_indicator,
+            width=24,
+            state="readonly",
+            values=(
+                "All indicators",
+                "SMA cross","EMA cross","RSI","MACD","Bollinger Bands",
+                "Stochastic","ATR","ADX","CCI","OBV","MFI","ROC","Williams %R","VWAP"
+            )
+        )
+        self.indicator_cb.pack(side=tk.RIGHT)
+        ttk.Label(params, text="Indicator:").pack(side=tk.RIGHT, padx=(0,6))
+        ttk.Button(params, text="Params…", command=self.on_params).pack(side=tk.RIGHT, padx=(6,0))
+        ttk.Button(params, text="Run Analysis", command=self.on_run).pack(side=tk.RIGHT)
+
+        # Middle: chart + table split
+        mid = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        mid.pack(fill=tk.BOTH, expand=True, pady=8)
+
+        # Chart panel
+        chart_frame = ttk.Frame(mid)
+        mid.add(chart_frame, weight=3)
+        self.fig = Figure(figsize=(6, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=chart_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Table panel
+        table_frame = ttk.Frame(mid)
+        mid.add(table_frame, weight=2)
+        cols = ("date", "signal", "price", "rule")
+        self.tree = ttk.Treeview(table_frame, columns=cols, show="headings")
+        for c in cols:
+            self.tree.heading(c, text=c.capitalize())
+            self.tree.column(c, width=120, anchor=tk.CENTER)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=(0,6))
+
+        # Returns toolbar
+        retbar = ttk.Frame(table_frame)
+        retbar.pack(side=tk.BOTTOM, fill=tk.X, pady=(0,6))
+        ttk.Label(retbar, text="Returns:").pack(side=tk.LEFT)
+        self.ret_mode = tk.StringVar(value="Long Returns")
+        ttk.Combobox(retbar, textvariable=self.ret_mode, state="readonly", width=14,
+                     values=("Long Returns","Short Returns")).pack(side=tk.LEFT, padx=6)
+        ttk.Button(retbar, text="Plot Returns", command=self.on_plot_returns).pack(side=tk.LEFT)
+        ttk.Button(retbar, text="Export Returns", command=self.on_export_returns).pack(side=tk.LEFT, padx=6)
+        ttk.Button(retbar, text="Export Signals", command=self.on_export_signals).pack(side=tk.LEFT, pady=6)
+
+        # Status bar
+        self.status = tk.StringVar(value="Load XLC or Fetch Yahoo data…")
+        ttk.Label(self, textvariable=self.status, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
+
+    # ----------------------------- Actions ----------------------------- #
+    def on_load_xlc(self):
+        path = filedialog.askopenfilename(
+            title="Select XLC (.xlsx)",
+            filetypes=[("Excel","*.xlsx")]
+        )
+        if not path:
+            return
+        try:
+            chooser = XLCChooser(self, path)
+            self.wait_window(chooser)
+            res = getattr(chooser, "result", None)
+            if not res:
+                return
+            sheet = res["sheet"]
+            pair_index = int(res["pair_index"])
+            pair_name = str(res["pair_name"]) if "pair_name" in res else ""
+            plot_overlays = bool(res.get("plot_overlays", True))
+
+            df = read_xlc(path, pair_index=pair_index, sheet=sheet)
+            self.df = df
+            self.xlc_path.set(f"{path} [{sheet}, pair {pair_index}]")
+            self.status.set(f"Loaded {len(df)} rows from XLC (sheet={sheet}, pair={pair_index}).")
+
+            # Optional overlays from other pairs on same sheet
+            self.xlc_overlays = None
+            if plot_overlays:
+                try:
+                    all_series = read_xlc_all(path, sheet=sheet)
+                    ov: Dict[str, pd.Series] = {}
+                    for name, s in all_series.items():
+                        if str(name) == pair_name:
+                            continue
+                        ov[f"XLC:{name}"] = s.reindex(df.index)
+                    self.xlc_overlays = ov if ov else None
+                except Exception:
+                    self.xlc_overlays = None
+
+            self._draw_empty_chart()
+            self._clear_table()
+        except Exception as e:
+            messagebox.showerror("Load error", str(e))
+
+    def on_export_signals(self):
+        if self.signals is None or self.signals.empty:
+            messagebox.showinfo("Export", "No signals to export. Run Analysis first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Signals XLC",
+            defaultextension=".xlsx",
+            filetypes=[("Excel","*.xlsx")],
+            initialfile="signals.xlsx"
+        )
+        if not path:
+            return
+        try:
+            buys = self.signals[self.signals["signal"]=="BUY"]["date price".split()].reset_index(drop=True)
+            sells = self.signals[self.signals["signal"]=="SELL"]["date price".split()].reset_index(drop=True)
+            n = max(len(buys), len(sells))
+            buys = buys.reindex(range(n))
+            sells = sells.reindex(range(n))
+            out = pd.DataFrame({
+                "BUY_Date": pd.to_datetime(buys["date"]),
+                "BUY_Value": buys["price"],
+                "SELL_Date": pd.to_datetime(sells["date"]),
+                "SELL_Value": sells["price"],
+            })
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                out.to_excel(writer, index=False, sheet_name="Signals")
+            messagebox.showinfo("Export", f"Signals saved to {path} (XLC pairs: BUY, SELL)")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+    def _bars_per_year(self) -> float:
+        """Infer bars-per-year from the current data frequency.
+        Fallbacks: daily=252, weekly=52, monthly=12, intraday uses ~6.5h trading day.
+        """
+        try:
+            idx = pd.to_datetime(self.df.index).sort_values()
+            if len(idx) < 2:
+                return 252.0
+            diffs = pd.Series(idx).diff().dt.total_seconds().dropna()
+            med_sec = float(diffs.median()) if not diffs.empty else None
+            if med_sec is None:
+                return 252.0
+            minutes = med_sec / 60.0
+            if minutes >= 28*24*60:   # ~monthly or worse
+                return 12.0
+            if minutes >= 5*24*60:    # ~weekly
+                return 52.0
+            if minutes >= 10*60:      # >= 10 hours → treat as daily
+                return 252.0
+            # intraday: scale by trading minutes per year (≈ 252 * 6.5 * 60)
+            trading_minutes_year = 252.0 * 6.5 * 60.0
+            return trading_minutes_year / max(minutes, 1e-6)
+        except Exception:
+            return 252.0
+
+    def _compute_returns(self, mode: str, choice: str) -> pd.DataFrame:
+        """Build completed trades for the selected indicator and compute annualized returns.
+        Ensures negative trades are included; handles ret <= -100% by clipping ann_ret to -100%.
+        """
+        if self.signals is None or self.signals.empty:
+            return pd.DataFrame(columns=["start","end","ret","ann_ret","side","clipped"]) 
+        sdf = self.signals.copy()
+
+        keymap = {
+            "SMA cross": ["SMA"],
+            "EMA cross": ["EMA"],
+            "RSI": ["RSI"],
+            "MACD": ["MACD"],
+            "Bollinger Bands": ["Bollinger"],
+            "Stochastic": ["Stoch"],
+        }
+        if choice not in keymap:
+            return pd.DataFrame(columns=["start","end","ret","ann_ret","side","clipped"]) 
+
+        pat = "|".join(map(repr, keymap[choice])).replace("'", "")
+        sdf = sdf[sdf["rule"].astype(str).str.contains(pat, case=False, na=False)]
+        if sdf.empty:
+            return pd.DataFrame(columns=["start","end","ret","ann_ret","side","clipped"]) 
+
+        sdf["date"] = pd.to_datetime(sdf["date"])  # ensure datetime
+        sdf = sdf.sort_values("date").reset_index(drop=True)
+
+        trades = []
+        holding = None  # (start_date, start_price)
+        want_open  = "BUY"  if mode.startswith("Long")  else "SELL"
+        want_close = "SELL" if mode.startswith("Long")  else "BUY"
+        bpy = self._bars_per_year()
+        idx = pd.to_datetime(self.df.index)
+
+        for r in sdf.itertuples(index=False):
+            sig = getattr(r, "signal", "")
+            dt = getattr(r, "date")
+            px = float(getattr(r, "price", float("nan")))
+            if sig == want_open and holding is None:
+                holding = (dt, px)
+            elif sig == want_close and holding is not None:
+                start_dt, start_px = holding
+                end_dt, end_px = dt, px
+                # simple price return (include negatives)
+                ret = (end_px / start_px) - 1.0 if mode.startswith("Long") else (start_px / end_px) - 1.0
+                # number of bars between entry and exit (inclusive)
+                mask = (idx >= pd.to_datetime(start_dt)) & (idx <= pd.to_datetime(end_dt))
+                n_bars = int(mask.sum()) or 1
+                # robust annualization; clip if total loss worse than -100% (undefined)
+                if (1.0 + ret) <= 0:
+                    ann = -1.0
+                    clipped = True
+                else:
+                    ann = (1.0 + ret) ** (bpy / n_bars) - 1.0
+                    clipped = False
+                trades.append({
+                    "start": pd.to_datetime(start_dt),
+                    "end": pd.to_datetime(end_dt),
+                    "ret": ret,
+                    "ann_ret": ann,
+                    "side": "LONG" if mode.startswith("Long") else "SHORT",
+                    "clipped": clipped,
+                })
+                holding = None
+
+        self.returns_df = pd.DataFrame(trades)
+        return self.returns_df
+
+    def on_plot_returns(self):
+        mode = self.ret_mode.get() if hasattr(self, "ret_mode") else "Long Returns"
+        choice = self.sel_indicator.get() if hasattr(self, "sel_indicator") else "All indicators"
+        if choice == "All indicators":
+            messagebox.showinfo("Returns", "Select a single indicator in the dropdown to compute returns.")
+            return
+        df = self._compute_returns(mode, choice)
+        if df is None or df.empty:
+            messagebox.showinfo("Returns", "No completed trades to plot.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"{mode} – Annualized Returns ({choice})")
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True)
+        fig = Figure(figsize=(9,4.5), dpi=100)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=frame)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        from matplotlib.patches import Rectangle
+        for r in df.itertuples(index=False):
+            x0 = mdates.date2num(pd.to_datetime(getattr(r, "start")))
+            x1 = mdates.date2num(pd.to_datetime(getattr(r, "end")))
+            width = max(x1 - x0, 1e-6)
+            h = float(getattr(r, "ann_ret", 0.0))
+            clipped = bool(getattr(r, "clipped", False))
+            y = 0.0 if h >= 0 else h
+            color = "tab:green" if h >= 0 else "tab:red"
+            rect = Rectangle((x0, y), width, abs(h if np.isfinite(h) else 0.0),
+                             facecolor=color, edgecolor="black", linewidth=0.5,
+                             alpha=0.35, hatch="//" if clipped else None)
+            ax.add_patch(rect)
+        ax.axhline(0.0, color="gray", linewidth=1)
+        ax.set_ylabel("Annualized return")
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+        ax.set_xlim(mdates.date2num(pd.to_datetime(df["start"]).min()) - 1,
+                    mdates.date2num(pd.to_datetime(df["end"]).max()) + 1)
+        # pad Y to ensure negatives are visible even if very small
+        ymin = float(np.nanmin(df["ann_ret"])) if not df["ann_ret"].empty else -0.1
+        ymax = float(np.nanmax(df["ann_ret"])) if not df["ann_ret"].empty else 0.1
+        pad = max(0.05, 0.1 * (ymax - ymin if ymax > ymin else 1))
+        ax.set_ylim(ymin - pad, ymax + pad)
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(ax.xaxis.get_major_locator()))
+        ax.set_title(f"{mode} – {len(df)} trades")
+        fig.tight_layout()
+        canvas.draw()
+
+    def on_export_returns(self):
+        mode = self.ret_mode.get() if hasattr(self, "ret_mode") else "Long Returns"
+        choice = self.sel_indicator.get() if hasattr(self, "sel_indicator") else "All indicators"
+        if choice == "All indicators":
+            messagebox.showinfo("Export", "Select a single indicator in the dropdown to compute returns.")
+            return
+        df = self._compute_returns(mode, choice)
+        if df is None or df.empty:
+            messagebox.showinfo("Export", "No completed trades to export.")
+            return
+        path = filedialog.asksaveasfilename(title="Save Returns Excel", defaultextension=".xlsx", filetypes=[("Excel","*.xlsx")], initialfile=f"{mode.replace(' ', '_').lower()}_returns.xlsx")
+        if not path:
+            return
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                df_out = df.copy()
+                df_out["start"] = pd.to_datetime(df_out["start"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+                df_out["end"] = pd.to_datetime(df_out["end"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+                df_out.to_excel(writer, sheet_name="returns", index=False)
+            messagebox.showinfo("Export", f"Returns saved to {path}")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+    def on_params(self):
+        name = self.sel_indicator.get() if hasattr(self, "sel_indicator") else "All indicators"
+        if name == "All indicators":
+            messagebox.showinfo("Params", "Choose a single indicator in the dropdown first.")
+            return
+        cur = self.params.get(name, {})
+        dlg = ParamDialog(self, name, cur)
+        self.wait_window(dlg)
+        vals = getattr(dlg, "values", None)
+        if vals is not None:
+            self.params[name] = vals
+            try:
+                self.status.set(f"Updated {name} params: {vals}")
+            except Exception:
+                pass
+
+    def on_fetch_yahoo(self):
+        ticker = self.ticker_var.get().strip()
+        if not ticker:
+            messagebox.showwarning("Ticker", "Enter a ticker (e.g., AAPL)")
+            return
+        try:
+            # Clear any XLC overlays when switching to Yahoo data
+            self.xlc_overlays = None
+            interval = (self.interval_var.get().strip() or "1d")
+            end = self.end_var.get().strip() or date.today().isoformat()
+            start = self.start_var.get().strip() or self._default_start_from_end(end)
+            df = fetch_yahoo(ticker, start=start, end=end, interval=interval)
+            self.df = df
+            range_msg = f", {start}→{end}" if (start or end) else ""
+            self.status.set(f"Fetched {len(df)} rows for {ticker} ({interval}{range_msg})")
+            self._draw_empty_chart()
+            self._clear_table()
+        except Exception as e:
+            messagebox.showerror("Yahoo error", str(e))
+
+    def on_run(self):
+        if self.df is None or self.df.empty:
+            messagebox.showinfo("No data", "Load or fetch data first.")
+            return
+        try:
+            self._reset_chart()
+            df = self.df.copy()
+            close = df["close"].astype(float)
+
+            overlays: Dict[str, pd.Series] = {}
+            sigs: List[Signal] = []
+
+            # Dropdown selector helper
+            choice = getattr(self, "sel_indicator", tk.StringVar(value="All indicators")).get()
+            def chosen(name: str) -> bool:
+                return (choice == "All indicators") or (choice == name)
+
+            # Defaults for params
+            sf, ss = 10, 20               # SMA
+            ef, es = 12, 26               # EMA
+            rsi_p, rsi_lo, rsi_hi = 14, 30.0, 70.0
+            mac_f, mac_s, mac_sig = 12, 26, 9
+            bb_n, bb_std = 20, 2.0
+            st_k, st_d = 14, 3
+            atr_n = adx_n = 14
+            cci_n = 20
+            mfi_n = 14
+            roc_n = 12
+            wr_n = 14
+            _p = getattr(self, 'params', {})
+            sf = int(_p.get('SMA cross',{}).get('fast', sf)); ss = int(_p.get('SMA cross',{}).get('slow', ss))
+            ef = int(_p.get('EMA cross',{}).get('fast', ef)); es = int(_p.get('EMA cross',{}).get('slow', es))
+            rsi_p = int(_p.get('RSI',{}).get('period', rsi_p)); rsi_lo = float(_p.get('RSI',{}).get('low', rsi_lo)); rsi_hi = float(_p.get('RSI',{}).get('high', rsi_hi))
+            mac_f = int(_p.get('MACD',{}).get('fast', mac_f)); mac_s = int(_p.get('MACD',{}).get('slow', mac_s)); mac_sig = int(_p.get('MACD',{}).get('signal', mac_sig))
+            bb_n = int(_p.get('Bollinger Bands',{}).get('period', bb_n)); bb_std = float(_p.get('Bollinger Bands',{}).get('stds', bb_std))
+            st_k = int(_p.get('Stochastic',{}).get('k', st_k)); st_d = int(_p.get('Stochastic',{}).get('d', st_d))
+            atr_n = int(_p.get('ATR',{}).get('period', atr_n))
+            adx_n = int(_p.get('ADX',{}).get('period', adx_n))
+            cci_n = int(_p.get('CCI',{}).get('period', cci_n))
+            mfi_n = int(_p.get('MFI',{}).get('period', mfi_n))
+            roc_n = int(_p.get('ROC',{}).get('period', roc_n))
+            wr_n = int(_p.get('Williams %R',{}).get('period', wr_n))
+
+            hi = df["high"] if "high" in df.columns else None
+            lo = df["low"] if "low" in df.columns else None
+            vol = df["volume"] if "volume" in df.columns else None
+            skipped: List[str] = []
+
+            # Include XLC overlays only when showing All indicators
+            if choice == "All indicators" and getattr(self, "xlc_overlays", None):
+                for k, s in self.xlc_overlays.items():
+                    overlays[k] = s
+
+            # --- SMA / EMA / RSI ---
+            if chosen("SMA cross"):
+                f = sma(close, sf); s = sma(close, ss)
+                overlays[f.name] = f; overlays[s.name] = s
+                sigs += cross_signals(df, f, s, "SMA")
+
+            if chosen("EMA cross"):
+                f = ema(close, ef); s = ema(close, es)
+                overlays[f.name] = f; overlays[s.name] = s
+                sigs += cross_signals(df, f, s, "EMA")
+
+            if chosen("RSI"):
+                r = rsi(close, rsi_p)
+                overlays[r.name] = r
+                sigs += rsi_signals(df, r, rsi_lo, rsi_hi)
+
+            # --- Others ---
+            if chosen("MACD"):
+                m_line, s_line, _ = macd(close, mac_f, mac_s, mac_sig)
+                overlays[m_line.name] = m_line; overlays[s_line.name] = s_line
+                sigs += macd_signals(df, m_line, s_line)
+
+            if chosen("Bollinger Bands"):
+                mid, up, lowb = bollinger(close, bb_n, bb_std)
+                overlays[mid.name] = mid; overlays[up.name] = up; overlays[lowb.name] = lowb
+                sigs += bbands_signals(df, close, lowb, up)
+
+            if chosen("Stochastic"):
+                if hi is not None and lo is not None:
+                    k_line, d_line = stochastic_kd(hi.astype(float), lo.astype(float), close, st_k, st_d)
+                    overlays[k_line.name] = k_line; overlays[d_line.name] = d_line
+                    sigs += stoch_signals(df, k_line, d_line)
+                else:
+                    skipped.append("Stochastic (needs High/Low)")
+
+            if chosen("ATR"):
+                if hi is not None and lo is not None:
+                    overlays[atr(hi.astype(float), lo.astype(float), close, atr_n).name] = atr(hi.astype(float), lo.astype(float), close, atr_n)
+                else:
+                    skipped.append("ATR (needs High/Low)")
+
+            if chosen("ADX"):
+                if hi is not None and lo is not None:
+                    adx_line, _, _ = adx(hi.astype(float), lo.astype(float), close, adx_n)
+                    overlays[adx_line.name] = adx_line
+                else:
+                    skipped.append("ADX (needs High/Low)")
+
+            if chosen("CCI"):
+                if hi is not None and lo is not None:
+                    overlays[cci(hi.astype(float), lo.astype(float), close, cci_n).name] = cci(hi.astype(float), lo.astype(float), close, cci_n)
+                else:
+                    skipped.append("CCI (needs High/Low)")
+
+            if chosen("OBV"):
+                if vol is not None:
+                    overlays[obv(close, vol).name] = obv(close, vol)
+                else:
+                    skipped.append("OBV (needs Volume)")
+
+            if chosen("MFI"):
+                if vol is not None and hi is not None and lo is not None:
+                    overlays[mfi(hi.astype(float), lo.astype(float), close, vol, mfi_n).name] = mfi(hi.astype(float), lo.astype(float), close, vol, mfi_n)
+                else:
+                    skipped.append("MFI (needs High/Low/Volume)")
+
+            if chosen("ROC"):
+                overlays[roc(close, roc_n).name] = roc(close, roc_n)
+
+            if chosen("Williams %R"):
+                if hi is not None and lo is not None:
+                    overlays[williams_r(hi.astype(float), lo.astype(float), close, wr_n).name] = williams_r(hi.astype(float), lo.astype(float), close, wr_n)
+                else:
+                    skipped.append("Williams %R (needs High/Low)")
+
+            if chosen("VWAP"):
+                if vol is not None and hi is not None and lo is not None:
+                    overlays[vwap(hi.astype(float), lo.astype(float), close, vol).name] = vwap(hi.astype(float), lo.astype(float), close, vol)
+                else:
+                    skipped.append("VWAP (needs High/Low/Volume)")
+
+            # Build signals DataFrame
+            rows = [{"date": s.date, "signal": s.side, "price": s.price, "rule": s.rule} for s in sigs]
+            self.signals = pd.DataFrame(rows).sort_values("date") if rows else pd.DataFrame(columns=["date","signal","price","rule"])
+
+            # reset previously computed returns
+            self.returns_df = None
+
+            self._update_table()
+            self._plot(df, overlays, self.signals)
+            msg = f"Analysis complete. Signals: {0 if self.signals is None else len(self.signals)}"
+            if 'skipped' in locals() and skipped:
+                msg += " | Skipped: " + ", ".join(skipped)
+            self.status.set(msg)
+        except Exception as e:
+            messagebox.showerror("Analysis error", str(e))
+
+    # ----------------------------- UI helpers ----------------------------- #
+    def _reset_chart(self):
+        # Remove any secondary axes from previous plots and clear primary
+        for axx in list(self.fig.axes)[1:]:
+            try:
+                self.fig.delaxes(axx)
+            except Exception:
+                pass
+        self.ax.clear()
+    def _draw_empty_chart(self):
+        self._reset_chart()
+        self.ax.set_title("Price & Indicators")
+        self.ax.set_xlabel("Date")
+        self.ax.set_ylabel("Price")
+        self.canvas.draw()
+
+    def _clear_table(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+    def _default_start_from_end(self, end_str: str) -> str:
+        try:
+            end_dt = datetime.fromisoformat(end_str).date()
+        except Exception:
+            end_dt = date.today()
+        jan1 = date(end_dt.year, 1, 1)
+        ago90 = end_dt - timedelta(days=90)
+        # Use whichever happened earlier (older in time)
+        start_dt = jan1 if jan1 <= ago90 else ago90
+        return start_dt.isoformat()
+
+    def _update_table(self):
+        self._clear_table()
+        if self.signals is None or self.signals.empty:
+            return
+        for _, row in self.signals.iterrows():
+            self.tree.insert("", tk.END, values=(
+                pd.to_datetime(row["date"]).strftime("%Y-%m-%d"),
+                row["signal"],
+                f"{float(row['price']):.4f}",
+                row["rule"],
+            ))
+
+    def _plot(self, df: pd.DataFrame, overlays: Dict[str, pd.Series], s_df: pd.DataFrame):
+        # Ensure we don't stack multiple right axes
+        for axx in list(self.fig.axes)[1:]:
+            try:
+                self.fig.delaxes(axx)
+            except Exception:
+                pass
+        self.ax.clear()
+        dates = pd.to_datetime(df.index)
+        self.ax.plot(dates, df["close"].astype(float), label="Close", linewidth=1.5, color="tab:blue")
+
+        # Color palette for indicators (avoid blue)
+        palette = ["tab:orange","tab:green","tab:red","tab:purple","tab:brown","tab:pink","tab:gray","tab:olive","tab:cyan"]
+        left_colors = iter(palette)
+        right_colors = iter(palette)
+
+        def scale_0_100(s: pd.Series) -> pd.Series:
+            s = s.astype(float)
+            mn = np.nanmin(s.values)
+            mx = np.nanmax(s.values)
+            if not np.isfinite(mn) or not np.isfinite(mx) or np.isclose(mn, mx):
+                return pd.Series(np.nan, index=s.index)
+            return 100 * (s - mn) / (mx - mn)
+
+        # Decide which names go on price (left) vs indicators (right)
+        left_prefixes = ("SMA", "EMA", "BBM", "BBU", "BBL", "VWAP", "XLC")
+        right_names = set()
+        for n in overlays.keys():
+            if not n.startswith(left_prefixes):
+                right_names.add(n)
+
+        rsiax = None
+        for name, series in overlays.items():
+            try:
+                if name.startswith(left_prefixes):
+                    c = next(left_colors, "tab:gray")
+                    self.ax.plot(dates, series, label=name, linewidth=1, color=c)
+                else:
+                    if rsiax is None:
+                        rsiax = self.ax.twinx()
+                        rsiax.set_ylabel("Indicators (right)")
+                        rsiax.set_ylim(0, 100)
+                        rsiax.set_yticks([0, 20, 30, 50, 70, 80, 100])
+                        rsiax.tick_params(axis="y", which="both", labelright=True, right=True)
+                    # Natural 0-100 oscillators
+                    if name.upper().startswith("RSI") or name.upper().startswith("STOCH") or name.upper().startswith("MFI") or name.upper().startswith("ADX"):
+                        rsiax.plot(dates, series, label=name, linewidth=1, color=next(right_colors, "tab:gray"))
+                    elif name.upper().startswith("W%R"):
+                        rsiax.plot(dates, 100 + series, label=name+" (shifted)", linewidth=1, color=next(right_colors, "tab:gray"))
+                    else:
+                        rsiax.plot(dates, scale_0_100(series), label=name+" (scaled)", linewidth=1, color=next(right_colors, "tab:gray"))
+            except Exception:
+                pass
+
+        # Plot signals
+        if s_df is not None and not s_df.empty:
+            buys = s_df[s_df["signal"] == "BUY"]
+            sells = s_df[s_df["signal"] == "SELL"]
+            if not buys.empty:
+                self.ax.plot(pd.to_datetime(buys["date"]), buys["price"], marker="^", linestyle="None", label="BUY", color="tab:green")
+            if not sells.empty:
+                self.ax.plot(pd.to_datetime(sells["date"]), sells["price"], marker="v", linestyle="None", label="SELL", color="tab:red")
+
+        self.ax.grid(True, alpha=0.3)
+        # combine legends from both axes
+        handles, labels = self.ax.get_legend_handles_labels()
+        if 'rsiax' in locals() and rsiax is not None:
+            h2, l2 = rsiax.get_legend_handles_labels()
+            handles += h2; labels += l2
+        if handles:
+            self.ax.legend(handles, labels, loc="best", fontsize=8)
+        self.ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        self.ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(self.ax.xaxis.get_major_locator()))
+        self.fig.tight_layout(rect=(0, 0, 0.92, 1))
+        self.canvas.draw()
+
+
+def main():
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
